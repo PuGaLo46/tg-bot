@@ -2,10 +2,10 @@ import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = 8430668114:AAGnP4RGqC1Q3d5lsyFth8ubUY4lI6lHVrg("BOT_TOKEN")
 
 async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот жив ✅")
+    await update.message.reply_text("Ку-ку Ёпта🤙")
 
 def main():
     if not BOT_TOKEN:
