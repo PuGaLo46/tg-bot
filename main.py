@@ -1,8 +1,10 @@
 import os
 import logging
+import time
 from collections import defaultdict, deque
 
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -13,140 +15,136 @@ from telegram.ext import (
 
 from openai import OpenAI
 
-# ================= CONFIG =================
+# ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# память диалога: (user_id, thread_id)
-dialog_memory = defaultdict(lambda: deque(maxlen=10))
+# память: пользователь + тема → последние сообщения
+memory = defaultdict(lambda: deque(maxlen=8))
 
-# память стиля: только ТВОИ сообщения
-# user_id -> последние сообщения пользователя как примеры стиля
-style_memory = defaultdict(lambda: deque(maxlen=20))
+# анти-спам / анти-429
+last_request_time = defaultdict(float)
+MIN_DELAY = 8  # секунд между запросами к OpenAI от одного юзера
 
-# ================= LOGGING =================
+# ================== LOGGING ==================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tg-ai-bot")
 
-# ================= OPENAI =================
+# ================== OPENAI ===================
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ================= HELPERS =================
-def thread_id(update: Update):
-    return update.message.message_thread_id
-
-
-def dialog_key(update: Update):
-    return (update.effective_user.id, thread_id(update))
-
-
-# ================= COMMANDS =================
+# ================== COMMANDS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Я ИИ-бот 🤖\n"
-        "Я подстраиваюсь под твой стиль общения.\n"
-        "Чем больше ты пишешь — тем точнее стиль.\n\n"
+        "Отвечаю в той же теме.\n"
+        "Пиши нормально — отвечу.\n\n"
         "Команды:\n"
-        "/reset — сбросить контекст темы\n"
-        "/style_reset — сбросить стиль",
-        message_thread_id=thread_id(update),
+        "/reset — сброс контекста\n"
+        "/ping — проверка",
+        message_thread_id=update.message.message_thread_id
+    )
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "OK ✅",
+        message_thread_id=update.message.message_thread_id
     )
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dialog_memory[dialog_key(update)].clear()
+    uid = update.effective_user.id
+    thread_id = update.message.message_thread_id or 0
+    memory[(uid, thread_id)].clear()
     await update.message.reply_text(
-        "Контекст темы сброшен 🧠",
-        message_thread_id=thread_id(update),
+        "Контекст очищен 🧠",
+        message_thread_id=thread_id
     )
 
 
-async def style_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    style_memory[update.effective_user.id].clear()
-    await update.message.reply_text(
-        "Стиль сброшен. Начинаю учиться заново ✍️",
-        message_thread_id=thread_id(update),
-    )
-
-
-# ================= TEXT HANDLER =================
+# ================== MAIN HANDLER ==================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text:
+    message = update.message
+    if not message or not message.text:
         return
 
-    tid = thread_id(update)
+    text = message.text.strip()
+    if len(text) < 3:
+        return  # режем мусор и экономим лимиты
+
     uid = update.effective_user.id
+    thread_id = message.message_thread_id or 0
+    key = (uid, thread_id)
+
+    # анти-429
+    now = time.time()
+    if now - last_request_time[uid] < MIN_DELAY:
+        await message.reply_text(
+            "⏳ Подожди пару секунд, думаю…",
+            message_thread_id=thread_id
+        )
+        return
+    last_request_time[uid] = now
 
     # typing
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action="typing",
-        message_thread_id=tid,
+        chat_id=message.chat_id,
+        action=ChatAction.TYPING
     )
 
-    if not BOT_TOKEN or not OPENAI_API_KEY:
-        await update.message.reply_text(
-            "Ошибка конфигурации. Проверь переменные Railway.",
-            message_thread_id=tid,
-        )
-        return
-
-    # === сохраняем стиль (ТОЛЬКО твои сообщения) ===
-    style_memory[uid].append(text)
-
-    # === system prompt из твоего стиля ===
-    style_examples = "\n".join(f"- {m}" for m in style_memory[uid])
-
+    # системный промпт — копируем ТВОЙ стиль
     system_prompt = (
-        "Ты — ассистент, который отвечает в стиле пользователя.\n"
-        "Копируй манеру речи, длину фраз, лексику, пунктуацию и тон.\n"
-        "Не объясняй, что ты копируешь стиль.\n\n"
-        "Примеры сообщений пользователя:\n"
-        f"{style_examples}"
+        "Ты — телеграм-бот, который копирует стиль автора.\n"
+        "Пиши коротко, по-человечески, без пафоса.\n"
+        "Разговорный стиль, как в чате.\n"
+        "Если вопрос простой — ответ простой.\n"
+        "Язык: русский."
     )
 
     messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(dialog_memory[dialog_key(update)])
+    messages.extend(list(memory[key]))
     messages.append({"role": "user", "content": text})
 
     try:
         resp = client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            temperature=0.8,
+            temperature=0.6,
         )
-        answer = (resp.choices[0].message.content or "").strip()
+        answer = resp.choices[0].message.content.strip()
+        if not answer:
+            answer = "Хм… попробуй переформулировать."
     except Exception as e:
         log.exception("OpenAI error")
-        await update.message.reply_text(
-            f"Ошибка ИИ: {e}",
-            message_thread_id=tid,
+        await message.reply_text(
+            f"⚠️ Ошибка ИИ: {e}",
+            message_thread_id=thread_id
         )
         return
 
-    # сохраняем диалог
-    dialog_memory[dialog_key(update)].append({"role": "user", "content": text})
-    dialog_memory[dialog_key(update)].append({"role": "assistant", "content": answer})
+    # сохраняем контекст
+    memory[key].append({"role": "user", "content": text})
+    memory[key].append({"role": "assistant", "content": answer})
 
-    await update.message.reply_text(
+    await message.reply_text(
         answer[:4000],
-        message_thread_id=tid,
+        message_thread_id=thread_id
     )
 
 
-# ================= MAIN =================
+# ================== APP ==================
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN env var is missing")
+        raise RuntimeError("BOT_TOKEN is missing")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("style_reset", style_reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     log.info("Bot started")
