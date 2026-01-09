@@ -1,7 +1,7 @@
 import os
 import logging
-import time
 from collections import defaultdict, deque
+from typing import Deque, Dict, Tuple, Optional
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -15,178 +15,210 @@ from telegram.ext import (
 
 from openai import OpenAI
 
-# ================== CONFIG ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# =========================
+# CONFIG (env)
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# LLM (OpenAI-compatible: OpenAI / DeepSeek / Qwen compatible endpoints)
-LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip() or None
+# Unified LLM vars (works with OpenAI / DeepSeek / Qwen OpenAI-compatible gateways)
+LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", "")).strip()
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "").strip()  # e.g. https://api.openai.com/v1 OR provider gateway base
+LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")).strip()
 
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # твой user_id (число), нужен для админ-команд
+# Optional: restrict bot to only you (recommended)
+# Put your numeric Telegram user id in Railway variable OWNER_ID
+OWNER_ID = os.getenv("OWNER_ID", "").strip()
 
-# style file in repo
-STYLE_FILE_PATH = os.getenv("STYLE_FILE_PATH", "style.txt")
+# Style file path in repo root
+STYLE_PATH = os.getenv("STYLE_PATH", "style.txt").strip()
 
-# Память по темам: (chat_id, thread_id) -> deque
-thread_memory = defaultdict(lambda: deque(maxlen=16))
+# Memory: keep last N messages (user+assistant) per (chat_id, thread_id, user_id)
+MEMORY_MAXLEN = int(os.getenv("MEMORY_MAXLEN", "18"))
 
-# анти-спам по одному чату (чтобы не ловить лимиты)
-last_request_ts = defaultdict(float)
-MIN_DELAY_SEC = float(os.getenv("MIN_DELAY_SEC", "3.0"))
-
-# ================== LOGGING ==================
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tg-ai-bot")
 
-# ================== LLM CLIENT ==================
-client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL) if LLM_BASE_URL else OpenAI(api_key=LLM_API_KEY)
-
-# ================== STYLE LOADING ==================
-STYLE_TEXT_CACHE = ""
-STYLE_MTIME_CACHE = 0.0
+# =========================
+# STYLE LOADING
+# =========================
+_cached_style: str = ""
 
 
-def load_style_text(force: bool = False) -> str:
-    """Loads style.txt from disk. Cached + reload on file mtime change."""
-    global STYLE_TEXT_CACHE, STYLE_MTIME_CACHE
-
+def load_style_text() -> str:
+    global _cached_style
     try:
-        mtime = os.path.getmtime(STYLE_FILE_PATH)
-        if (not force) and STYLE_TEXT_CACHE and mtime == STYLE_MTIME_CACHE:
-            return STYLE_TEXT_CACHE
-
-        with open(STYLE_FILE_PATH, "r", encoding="utf-8") as f:
+        with open(STYLE_PATH, "r", encoding="utf-8") as f:
             txt = f.read().strip()
-
-        STYLE_TEXT_CACHE = txt
-        STYLE_MTIME_CACHE = mtime
-        return txt
-
+            _cached_style = txt
+            return txt
     except FileNotFoundError:
+        _cached_style = ""
         return ""
-    except Exception as e:
-        log.exception("Failed to load style file: %s", e)
-        return ""
+    except Exception:
+        log.exception("Failed to read style.txt")
+        return _cached_style or ""
 
 
 def build_system_prompt(style_text: str) -> str:
-    base_rules = (
-        "Ты отвечаешь на русском и пишешь в стиле владельца бота.\n"
-        "Правила:\n"
-        "— копируй манеру речи, длину фраз, сленг/мат (если он в примерах), пунктуацию, эмодзи\n"
-        "— не объясняй, что копируешь стиль; просто отвечай так\n"
-        "— не становись официальным, если в примерах не так\n"
-        "— если не уверен — честно скажи, что не уверен\n"
-        "— отвечай по делу, без воды\n"
+    # Важно: это жёсткая инструкция. Модель не должна "обсуждать стиль".
+    base = (
+        "Ты — Арт (Артём). Ты отвечаешь как реальный Арт, его манерой речи.\n"
+        "Ты НЕ ассистент, НЕ ИИ, НЕ бот. Никогда не говори, что ты ИИ/бот/модель.\n"
+        "Отвечай естественно, как Арт в переписке.\n\n"
+        "ЖЁСТКИЕ ПРАВИЛА:\n"
+        "- Копируй стиль Арта из STYLE ниже.\n"
+        "- Никаких вопросов про стиль (типа: 'какой стиль ты хочешь?').\n"
+        "- Не объясняй правила, не комментируй их.\n"
+        "- Не придумывай факты о себе. Если не знаешь — ответь коротко по-людски.\n"
+        "- Отвечай кратко, по делу, как в чате.\n"
+        "- Используй лексику/фразы/подачу из STYLE.\n\n"
+        "STYLE (примеры речи Арта):\n"
     )
 
-    if not style_text:
-        # fallback, если style.txt пустой/нет
-        return base_rules + "\nПримеры стиля не заданы. Пиши просто, разговорно и кратко.\n"
-
-    # чтобы не раздувать промпт, ограничим размер
-    # (если style.txt гигантский — оставим хвост)
-    max_chars = 6000
-    if len(style_text) > max_chars:
-        style_text = style_text[-max_chars:]
-
-    return base_rules + "\nПримеры сообщений владельца (это эталон стиля):\n" + style_text
-
-
-# ================== HELPERS ==================
-def thread_id(update: Update) -> int | None:
-    msg = update.effective_message
-    return getattr(msg, "message_thread_id", None)
-
-
-def key_for_thread(update: Update):
-    return (update.effective_chat.id, thread_id(update) or 0)
-
-
-async def reply_in_same_topic(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    tid = thread_id(update)
-    chat_id = update.effective_chat.id
-    if tid:
-        await context.bot.send_message(chat_id=chat_id, message_thread_id=tid, text=text[:4000])
+    if style_text:
+        return base + style_text
     else:
-        await update.effective_message.reply_text(text[:4000])
+        # Если файла нет — хоть какая-то страховка
+        return base + "(STYLE пуст. Пиши просто кратко и по-людски.)"
 
 
-def is_owner(update: Update) -> bool:
-    return OWNER_ID != 0 and update.effective_user and update.effective_user.id == OWNER_ID
+# Load style on startup
+load_style_text()
+
+# =========================
+# OPENAI-COMPAT CLIENT
+# =========================
+client_kwargs = {"api_key": LLM_API_KEY}
+if LLM_BASE_URL:
+    client_kwargs["base_url"] = LLM_BASE_URL
+
+client = OpenAI(**client_kwargs)
+
+# =========================
+# MEMORY STORE
+# =========================
+# key: (chat_id, thread_id, user_id) -> deque of messages
+MemoryKey = Tuple[int, int, int]
+memory: Dict[MemoryKey, Deque[dict]] = defaultdict(lambda: deque(maxlen=MEMORY_MAXLEN))
 
 
-# ================== COMMANDS ==================
+def parse_owner_id() -> Optional[int]:
+    if not OWNER_ID:
+        return None
+    try:
+        return int(OWNER_ID)
+    except ValueError:
+        return None
+
+
+OWNER_ID_INT = parse_owner_id()
+
+
+def get_thread_id(update: Update) -> int:
+    # For forum topics: message_thread_id exists
+    # If no topic -> use 0 as "main thread"
+    mtid = getattr(update.message, "message_thread_id", None)
+    return int(mtid) if mtid is not None else 0
+
+
+async def safe_reply(update: Update, text: str):
+    """Reply in the same topic/thread if it exists."""
+    chat_id = update.effective_chat.id
+    thread_id = get_thread_id(update)
+    # PTB supports message_thread_id in send_message
+    if thread_id != 0:
+        await update.get_bot().send_message(chat_id=chat_id, text=text[:4000], message_thread_id=thread_id)
+    else:
+        await update.message.reply_text(text[:4000])
+
+
+def is_allowed_user(update: Update) -> bool:
+    # If OWNER_ID is set -> only allow that user
+    if OWNER_ID_INT is None:
+        return True
+    uid = update.effective_user.id if update.effective_user else None
+    return uid == OWNER_ID_INT
+
+
+# =========================
+# COMMANDS
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_in_same_topic(
-        update, context,
-        "Я ИИ-бот 🤖\n"
-        "Стиль беру из файла style.txt (только стиль владельца, не учусь у других).\n"
-        "Команды: /reset, /ping\n"
-        "Админ: /style_reload"
-    )
+    if not is_allowed_user(update):
+        return
+    await safe_reply(update, "Я на месте. Пиши.")
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_in_same_topic(update, context, "OK ✅")
+    if not is_allowed_user(update):
+        return
+    await safe_reply(update, "OK ✅")
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    thread_memory[key_for_thread(update)].clear()
-    await reply_in_same_topic(update, context, "Контекст темы сброшен 🧠")
-
-
-async def style_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        await reply_in_same_topic(update, context, "Неа 🙂")
+    if not is_allowed_user(update):
         return
-    txt = load_style_text(force=True)
-    if not txt:
-        await reply_in_same_topic(update, context, "style.txt не найден или пустой.")
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    thread_id = get_thread_id(update)
+    key = (chat_id, thread_id, uid)
+    memory[key].clear()
+    await safe_reply(update, "Сбросил.")
+
+
+async def reload_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed_user(update):
         return
-    await reply_in_same_topic(update, context, f"style.txt перезагружен ✅ (символов: {len(txt)})")
+    txt = load_style_text()
+    if txt:
+        await safe_reply(update, "Стиль обновил.")
+    else:
+        await safe_reply(update, "style.txt пустой или не найден.")
 
 
-# ================== MESSAGE HANDLER ==================
+# =========================
+# MAIN HANDLER
+# =========================
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    text = (msg.text or "").strip()
+    if not update.message:
+        return
+    if not is_allowed_user(update):
+        return
+
+    text = (update.message.text or "").strip()
     if not text:
         return
 
-    # мелкий мусор не шлём в LLM
-    if len(text) < 3:
-        return
+    # typing
+    try:
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    except Exception:
+        pass
 
+    # env checks (user-facing, without silent fail)
     if not BOT_TOKEN:
-        await reply_in_same_topic(update, context, "Ошибка: BOT_TOKEN не задан в Railway Variables.")
+        await safe_reply(update, "Ошибка: BOT_TOKEN не задан.")
         return
     if not LLM_API_KEY:
-        await reply_in_same_topic(update, context, "Ошибка: LLM_API_KEY не задан в Railway Variables.")
+        await safe_reply(update, "Ошибка: LLM_API_KEY (или OPENAI_API_KEY) не задан.")
+        return
+    if not LLM_MODEL:
+        await safe_reply(update, "Ошибка: LLM_MODEL не задан.")
         return
 
-    tid = thread_id(update)
-    k = key_for_thread(update)
+    uid = update.effective_user.id
+    chat_id = update.effective_chat.id
+    thread_id = get_thread_id(update)
+    key = (chat_id, thread_id, uid)
 
-    # анти-спам на чат: не чаще MIN_DELAY_SEC
-    now = time.time()
-    if now - last_request_ts[k] < MIN_DELAY_SEC:
-        await reply_in_same_topic(update, context, "⏳ Секунду…")
-        return
-    last_request_ts[k] = now
-
-    # typing
-    if tid:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING, message_thread_id=tid)
-    else:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-    style_text = load_style_text()
+    style_text = _cached_style or load_style_text()
     system_prompt = build_system_prompt(style_text)
 
     messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(list(thread_memory[k]))
+    messages.extend(list(memory[key]))
     messages.append({"role": "user", "content": text})
 
     try:
@@ -197,40 +229,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         answer = (resp.choices[0].message.content or "").strip()
         if not answer:
-            answer = "Пустой ответ. Попробуй иначе сформулировать."
+            answer = "Пусто. Напиши иначе."
     except Exception as e:
-        s = str(e)
-        if "402" in s and "Insufficient" in s:
-            await reply_in_same_topic(update, context, "Баланс провайдера закончился (402). Пополни баланс или смени LLM.")
+        # common cases: 402 balance, 429 rate limit, etc.
+        msg = str(e)
+        if "Insufficient Balance" in msg or "402" in msg:
+            await safe_reply(update, "Бабки на апи кончились (402). Пополни баланс/проверь ключ.")
             return
-        if "429" in s or "rate" in s.lower():
-            await reply_in_same_topic(update, context, "Лимит запросов 😵‍💫 Подожди 20–60 сек и повтори.")
+        if "429" in msg or "Rate limit" in msg:
+            await safe_reply(update, "Слишком часто. Подожди чуть-чуть и повтори.")
             return
-        log.exception("LLM error")
-        await reply_in_same_topic(update, context, f"Ошибка ИИ: {e}")
+
+        log.exception("LLM request failed")
+        await safe_reply(update, f"Ошибка ИИ: {e}")
         return
 
-    # сохраняем контекст темы
-    thread_memory[k].append({"role": "user", "content": text})
-    thread_memory[k].append({"role": "assistant", "content": answer})
+    # save memory (per topic)
+    memory[key].append({"role": "user", "content": text})
+    memory[key].append({"role": "assistant", "content": answer})
 
-    await reply_in_same_topic(update, context, answer)
+    await safe_reply(update, answer)
 
 
-# ================== MAIN ==================
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN env var is missing")
-
-    # preload style once at boot (not required)
-    _ = load_style_text()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("style_reload", style_reload))
+    app.add_handler(CommandHandler("reload_style", reload_style))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
